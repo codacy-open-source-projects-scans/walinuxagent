@@ -1,0 +1,18 @@
+#
+# This test verifies following scenarios:
+# 1) checks agent can update to published version, run smoke tests
+# 2) checks agent can rollback to previous version, run smoke tests
+#
+name: "AgentPublish"
+tests:
+  - "agent_publish/agent_publish.py"
+  - "agent_publish/rollback.py"
+  - "agent_bvt/extension_operations.py"
+  - "agent_bvt/vm_access.py"
+  - "agent_bvt/run_command.py"
+images:
+  - "random(endorsed, 10)"
+  - "random(endorsed-arm64, 2)"
+locations: "AzureCloud:eastus2euap"
+owns_vm: true
+install_test_agent: false
