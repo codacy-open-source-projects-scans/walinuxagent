@@ -39,6 +39,7 @@ class _CpuController(_CgroupController):
         self._current_system_cpu = None
         self._previous_throttled_time = None
         self._current_throttled_time = None
+        self._track_throttle_time = False
 
     def _get_cpu_stat_counter(self, counter_name):
         """
@@ -108,7 +109,7 @@ class _CpuController(_CgroupController):
         """
         raise NotImplementedError()
 
-    def get_tracked_metrics(self, **kwargs):
+    def get_tracked_metrics(self):
         # Note: If the current cpu usage is less than the previous usage (metric is negative), then an empty array will
         # be returned and the agent won't track the metrics.
         tracked = []
@@ -116,7 +117,7 @@ class _CpuController(_CgroupController):
         if cpu_usage >= float(0):
             tracked.append(MetricValue(MetricsCategory.CPU_CATEGORY, MetricsCounter.PROCESSOR_PERCENT_TIME, self.name, cpu_usage))
 
-        if 'track_throttled_time' in kwargs and kwargs['track_throttled_time']:
+        if self._track_throttle_time:
             throttled_time = self.get_cpu_throttled_time()
             if cpu_usage >= float(0) and throttled_time >= float(0):
                 tracked.append(MetricValue(MetricsCategory.CPU_CATEGORY, MetricsCounter.THROTTLED_TIME, self.name, throttled_time))
@@ -126,6 +127,16 @@ class _CpuController(_CgroupController):
     def get_unit_properties(self):
         return ["CPUAccounting", "CPUQuotaPerSecUSec"]
 
+    def get_controller_type(self):
+        return "cpu"
+
+    def track_throttle_time(self, track_throttle_time):
+        """
+        Set whether the controller should track the throttle time or not. This is useful when the controller is used
+        for tracking CPU usage only.
+        """
+        self._track_throttle_time = track_throttle_time
+
 
 class CpuControllerV1(_CpuController):
     def initialize_cpu_usage(self):
@@ -133,7 +144,6 @@ class CpuControllerV1(_CpuController):
             raise CGroupsException("initialize_cpu_usage() should be invoked only once")
         self._current_cgroup_cpu = self._get_cpu_ticks(allow_no_such_file_or_directory_error=True)
         self._current_system_cpu = self._osutil.get_total_cpu_ticks_since_boot()
-        self._current_throttled_time = self._get_cpu_stat_counter(counter_name='throttled_time')
 
     def _get_cpu_ticks(self, allow_no_such_file_or_directory_error=False):
         """
@@ -189,6 +199,9 @@ class CpuControllerV1(_CpuController):
         if not self._cpu_usage_initialized():
             raise CGroupsException("initialize_cpu_usage() must be invoked before the first call to get_cpu_throttled_time()")
 
+        if self._current_throttled_time is None:
+            self._current_throttled_time = self._get_cpu_stat_counter(counter_name='throttled_time')
+
         self._previous_throttled_time = self._current_throttled_time
         self._current_throttled_time = self._get_cpu_stat_counter(counter_name='throttled_time')
 
@@ -224,7 +237,6 @@ class CpuControllerV2(_CpuController):
             raise CGroupsException("initialize_cpu_usage() should be invoked only once")
         self._current_cgroup_cpu = self._get_cpu_time(allow_no_such_file_or_directory_error=True)
         self._current_system_cpu = self._get_system_usage()
-        self._current_throttled_time = self._get_cpu_stat_counter(counter_name='throttled_usec')
 
     def _get_cpu_time(self, allow_no_such_file_or_directory_error=False):
         """
@@ -286,6 +298,9 @@ class CpuControllerV2(_CpuController):
 
         if not self._cpu_usage_initialized():
             raise CGroupsException("initialize_cpu_usage() must be invoked before the first call to get_cpu_throttled_time()")
+
+        if self._current_throttled_time is None:
+            self._current_throttled_time = self._get_cpu_stat_counter(counter_name='throttled_usec')
 
         self._previous_throttled_time = self._current_throttled_time
         self._current_throttled_time = self._get_cpu_stat_counter(counter_name='throttled_usec')

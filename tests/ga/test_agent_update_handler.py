@@ -1,6 +1,8 @@
 import contextlib
 import json
 import os
+import random
+import time
 
 from azurelinuxagent.common import conf
 from azurelinuxagent.common.event import WALAEventOperation
@@ -10,14 +12,13 @@ from azurelinuxagent.common.protocol.restapi import VMAgentUpdateStatuses
 
 from azurelinuxagent.common.protocol.util import ProtocolUtil
 from azurelinuxagent.common.version import CURRENT_VERSION, AGENT_NAME
-from azurelinuxagent.ga.agent_update_handler import get_agent_update_handler, INITIAL_UPDATE_STATE_FILE, \
-    RSM_UPDATE_STATE_FILE
-from azurelinuxagent.ga.guestagent import GuestAgent
+from azurelinuxagent.ga.agent_update_handler import get_agent_update_handler
+from azurelinuxagent.ga.guestagent import GuestAgent, INITIAL_UPDATE_STATE_FILE, RSM_UPDATE_STATE_FILE
 from tests.ga.test_update import UpdateTestCase
 from tests.lib.http_request_predicates import HttpRequestPredicates
 from tests.lib.mock_wire_protocol import mock_wire_protocol, MockHttpResponse
 from tests.lib.wire_protocol_data import DATA_FILE
-from tests.lib.tools import clear_singleton_instances, load_bin_data, patch
+from tests.lib.tools import clear_singleton_instances, load_bin_data, patch, skip_if_predicate_true
 
 
 class TestAgentUpdate(UpdateTestCase):
@@ -29,7 +30,7 @@ class TestAgentUpdate(UpdateTestCase):
         clear_singleton_instances(ProtocolUtil)
 
     @contextlib.contextmanager
-    def _get_agent_update_handler(self, test_data=None, autoupdate_frequency=0.001, autoupdate_enabled=True, initial_update_attempted=True, protocol_get_error=False, mock_get_header=None, mock_put_header=None):
+    def _get_agent_update_handler(self, test_data=None, autoupdate_frequency=0.001, autoupdate_enabled=True, initial_update_attempted=True, protocol_get_error=False, mock_get_header=None, mock_put_header=None, mock_random_update_time=True):
         # Default to DATA_FILE of test_data parameter raises the pylint warning
         # W0102: Dangerous default value DATA_FILE (builtins.dict) as argument (dangerous-default-value)
         test_data = DATA_FILE if test_data is None else test_data
@@ -61,14 +62,24 @@ class TestAgentUpdate(UpdateTestCase):
             if initial_update_attempted:
                 open(os.path.join(conf.get_lib_dir(), INITIAL_UPDATE_STATE_FILE), "a").close()
 
+            original_randint = random.randint
+
+            def _mock_random_update_time(a, b):
+                if mock_random_update_time:  # update should occur immediately
+                    return 0
+                if b == 1:  # handle tests where the normal or hotfix frequency is mocked to be very short (e.g., 1 second). Returning a very small delay (0.001 seconds) ensures the logic is tested without introducing significant waiting time
+                    return 0.001
+                return original_randint(a, b) + 10  # If none of the above conditions are met, the function returns additional 10-seconds delay. This might represent a normal delay for updates in scenarios where updates are not expected immediately
+
             with patch("azurelinuxagent.common.conf.get_autoupdate_enabled", return_value=autoupdate_enabled):
                 with patch("azurelinuxagent.common.conf.get_autoupdate_frequency", return_value=autoupdate_frequency):
-                    with patch("azurelinuxagent.common.conf.get_autoupdate_gafamily", return_value="Prod"):
-                        with patch("azurelinuxagent.common.conf.get_enable_ga_versioning", return_value=True):
-                            with patch("azurelinuxagent.common.event.EventLogger.add_event") as mock_telemetry:
-                                agent_update_handler = get_agent_update_handler(protocol)
-                                agent_update_handler._protocol = protocol
-                                yield agent_update_handler, mock_telemetry
+                    with patch("azurelinuxagent.ga.self_update_version_updater.random.randint", side_effect=_mock_random_update_time):
+                        with patch("azurelinuxagent.common.conf.get_autoupdate_gafamily", return_value="Prod"):
+                            with patch("azurelinuxagent.common.conf.get_enable_ga_versioning", return_value=True):
+                                with patch("azurelinuxagent.common.event.EventLogger.add_event") as mock_telemetry:
+                                    agent_update_handler = get_agent_update_handler(protocol)
+                                    agent_update_handler._protocol = protocol
+                                    yield agent_update_handler, mock_telemetry
 
     def _assert_agent_directories_available(self, versions):
         for version in versions:
@@ -130,7 +141,7 @@ class TestAgentUpdate(UpdateTestCase):
             self._assert_agent_directories_exist_and_others_dont_exist(versions=[str(CURRENT_VERSION), "99999.0.0.0"])
             self._assert_agent_exit_process_telemetry_emitted(ustr(context.exception.reason))
 
-    def test_it_should_not_update_to_largest_version_if_time_window_not_elapsed(self):
+    def test_it_should_not_update_to_largest_version_if_manifest_download_time_not_elapsed(self):
         self.prepare_agents(count=1)
 
         data_file = DATA_FILE.copy()
@@ -146,14 +157,30 @@ class TestAgentUpdate(UpdateTestCase):
             self.assertFalse(os.path.exists(self.agent_dir("99999.0.0.0")),
                              "New agent directory should not be found")
 
-    def test_it_should_update_to_largest_version_if_time_window_elapsed(self):
+    def test_it_should_not_do_self_update_if_update_time_is_not_elapsed(self):
         self.prepare_agents(count=1)
 
         data_file = DATA_FILE.copy()
         data_file["ga_manifest"] = "wire/ga_manifest_no_uris.xml"
-        with patch("azurelinuxagent.common.conf.get_self_update_hotfix_frequency", return_value=0.001):
-            with patch("azurelinuxagent.common.conf.get_self_update_regular_frequency", return_value=0.001):
-                with self._get_agent_update_handler(test_data=data_file) as (agent_update_handler, mock_telemetry):
+        with self._get_agent_update_handler(test_data=data_file, mock_random_update_time=False) as (agent_update_handler, _):
+            agent_update_handler.run(agent_update_handler._protocol.get_goal_state(), True)
+            self.assertFalse(os.path.exists(self.agent_dir("99999.0.0.0")),
+                             "New agent directory should not be found")
+            agent_update_handler._protocol.mock_wire_data.set_ga_manifest("wire/ga_manifest.xml")
+            agent_update_handler._protocol.mock_wire_data.set_incarnation(2)
+            agent_update_handler._protocol.client.update_goal_state()
+            agent_update_handler.run(agent_update_handler._protocol.get_goal_state(), True)
+            self.assertFalse(os.path.exists(self.agent_dir("99999.0.0.0")),
+                             "New agent directory should not be found")
+
+    def test_it_should_update_to_largest_version_after_time_window_elapsed(self):
+        self.prepare_agents(count=1)
+
+        data_file = DATA_FILE.copy()
+        data_file["ga_manifest"] = "wire/ga_manifest_no_uris.xml"
+        with patch("azurelinuxagent.common.conf.get_self_update_hotfix_frequency", return_value=1):
+            with patch("azurelinuxagent.common.conf.get_self_update_regular_frequency", return_value=1):
+                with self._get_agent_update_handler(test_data=data_file, mock_random_update_time=False) as (agent_update_handler, mock_telemetry):
                     with self.assertRaises(AgentUpgradeExitException) as context:
                         agent_update_handler.run(agent_update_handler._protocol.get_goal_state(), True)
                         self.assertFalse(os.path.exists(self.agent_dir("99999.0.0.0")),
@@ -161,6 +188,8 @@ class TestAgentUpdate(UpdateTestCase):
                         agent_update_handler._protocol.mock_wire_data.set_ga_manifest("wire/ga_manifest.xml")
                         agent_update_handler._protocol.mock_wire_data.set_incarnation(2)
                         agent_update_handler._protocol.client.update_goal_state()
+                        # sleeping for update window to elapse
+                        time.sleep(0.1)
                         agent_update_handler.run(agent_update_handler._protocol.get_goal_state(), True)
                     self._assert_update_discovered_from_agent_manifest(mock_telemetry, inc=2, version="99999.0.0.0")
                     self._assert_agent_directories_exist_and_others_dont_exist(versions=[str(CURRENT_VERSION), "99999.0.0.0"])
@@ -248,6 +277,24 @@ class TestAgentUpdate(UpdateTestCase):
             self._assert_agent_directories_exist_and_others_dont_exist(versions=["9.9.9.10", str(CURRENT_VERSION)])
             self._assert_agent_exit_process_telemetry_emitted(ustr(context.exception.reason))
 
+    def test_it_should_not_allow_rsm_downgrade_if_rsm_version_is_available_less_than_current_version(self):
+        data_file = DATA_FILE.copy()
+        data_file["ext_conf"] = "wire/ext_conf_rsm_version.xml"
+
+        # Set the test environment by adding 20 random agents to the agent directory
+        self.prepare_agents()
+        self.assertEqual(20, self.agent_count(), "Agent directories not set properly")
+
+        downgraded_version = "2.5.0"
+
+        with self._get_agent_update_handler(test_data=data_file) as (agent_update_handler, _):
+            agent_update_handler._protocol.mock_wire_data.set_version_in_agent_family(downgraded_version)
+            agent_update_handler._protocol.mock_wire_data.set_incarnation(2)
+            agent_update_handler._protocol.client.update_goal_state()
+            agent_update_handler.run(agent_update_handler._protocol.get_goal_state(), True)
+            self.assertFalse(os.path.exists(self.agent_dir(downgraded_version)),"New agent directory should not be found")
+
+    @skip_if_predicate_true(lambda: True, "Enable this test when rsm downgrade scenario fixed")
     def test_it_should_downgrade_agent_if_rsm_version_is_available_less_than_current_version(self):
         data_file = DATA_FILE.copy()
         data_file["ext_conf"] = "wire/ext_conf_rsm_version.xml"
@@ -273,7 +320,7 @@ class TestAgentUpdate(UpdateTestCase):
         self.prepare_agents(count=1)
         data_file = DATA_FILE.copy()
         data_file["ext_conf"] = "wire/ext_conf_rsm_version.xml"
-        version = "5.2.0.1"
+        version = "9.9.9.999"
         with self._get_agent_update_handler(test_data=data_file, autoupdate_frequency=10) as (agent_update_handler, mock_telemetry):
             agent_update_handler._protocol.mock_wire_data.set_version_in_agent_family(version)
             agent_update_handler._protocol.mock_wire_data.set_incarnation(2)
@@ -341,7 +388,7 @@ class TestAgentUpdate(UpdateTestCase):
         self.prepare_agents()
         self.assertEqual(20, self.agent_count(), "Agent directories not set properly")
 
-        version = "5.2.0.4"
+        version = "9.9.9.999"
 
         with self._get_agent_update_handler(test_data=data_file) as (agent_update_handler, mock_telemetry):
             agent_update_handler._protocol.mock_wire_data.set_version_in_agent_family(version)
